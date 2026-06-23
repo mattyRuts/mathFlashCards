@@ -146,10 +146,16 @@
     transition: transform 0.15s, background 0.15s;
   }
   #mic.listening { background: #4361ee; animation: pulse 1.2s ease-in-out infinite; }
+  #mic.rearming { background: #6b5b1f; }
+  #mic.blocked { background: #5e1f2e; }
   @keyframes pulse {
     0%, 100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(67,97,238,0.5); }
     50% { transform: scale(1.06); box-shadow: 0 0 0 18px rgba(67,97,238,0); }
   }
+  #micstatus { font-size: .95rem; font-weight: bold; min-height: 1.2rem; text-align: center; letter-spacing: .5px; }
+  #micstatus.s-listening { color: #6f8cff; }
+  #micstatus.s-rearming { color: #ffd166; }
+  #micstatus.s-blocked { color: #ef476f; }
   #heard { font-size: 1.6rem; font-weight: bold; color: #aab; min-height: 2rem; text-align: center; }
   #results { flex: 1; display: none; flex-direction: column; padding: 24px; gap: 16px; overflow-y: auto; }
   #results h1 { text-align: center; margin: 0; }
@@ -263,6 +269,7 @@
   </div>
   <div id="voicepanel">
     <div id="mic">&#127908;</div>
+    <div id="micstatus">&nbsp;</div>
     <div id="heard">&nbsp;</div>
   </div>
 </div>
@@ -365,6 +372,7 @@ const keypadEl = document.getElementById('keypad');
 const voicePanelEl = document.getElementById('voicepanel');
 const micEl = document.getElementById('mic');
 const heardEl = document.getElementById('heard');
+const micStatusEl = document.getElementById('micstatus');
 const scoreEl = document.getElementById('score');
 const streakEl = document.getElementById('streak');
 const clockEl = document.getElementById('clock');
@@ -377,7 +385,9 @@ let answerLen = 1;
 let misses = {};
 let timerStart = 0, timerRAF = null, locked = false;
 let gameStart = 0, gameElapsed = 0, clockRAF = null;
-let recog = null, recogActive = false;
+let recog = null;          // current SpeechRecognition session
+let listenWindowOpen = false;  // true for the whole question's listening window
+let rearmTimer = null;     // timeout id for the re-arm delay
 let koPool = [];        // array of copies still to answer; entries are {a, b, id}
 let koCurrent = null;   // the pool entry being asked right now
 let koTotal = 0;        // distinct combos at start (win = all knocked out)
@@ -492,62 +502,119 @@ function showInputMode() {
   }
 }
 
+function setMicState(state) {
+  // state: 'listening' | 'rearming' | 'blocked' | 'idle'
+  micEl.classList.remove('listening', 'rearming', 'blocked');
+  micStatusEl.classList.remove('s-listening', 's-rearming', 's-blocked');
+  if (state === 'listening') {
+    micEl.classList.add('listening');
+    micStatusEl.classList.add('s-listening');
+    micStatusEl.textContent = 'Listening\u2026';
+  } else if (state === 'rearming') {
+    micEl.classList.add('rearming');
+    micStatusEl.classList.add('s-rearming');
+    micStatusEl.textContent = 'one sec\u2026';
+  } else if (state === 'blocked') {
+    micEl.classList.add('blocked');
+    micStatusEl.classList.add('s-blocked');
+    micStatusEl.textContent = 'Mic blocked';
+  } else {
+    micStatusEl.textContent = '\u00A0';
+  }
+}
+
+// Open the listening window for the current question. Android's Web Speech API
+// only does single-shot recognition, so we cycle sessions back-to-back until the
+// question is answered or the timer ends.
 function startListening() {
   if (!voiceOn || !voiceSupported) return;
   heardEl.textContent = '\u00A0';
+  listenWindowOpen = true;
+  armRecognition();
+}
+
+function armRecognition() {
+  if (!listenWindowOpen || locked) return;
+  let session;
   try {
-    recog = new SpeechRec();
-    recog.lang = 'en-US';
-    recog.continuous = true;
-    recog.interimResults = true;
-    recog.maxAlternatives = 5;
-    recog.onstart = () => { recogActive = true; micEl.classList.add('listening'); };
-    recog.onend = () => { recogActive = false; micEl.classList.remove('listening'); };
-    recog.onerror = ev => {
-      recogActive = false;
-      micEl.classList.remove('listening');
-      if (ev.error === 'not-allowed' || ev.error === 'service-not-allowed') {
-        heardEl.textContent = 'Mic blocked';
-      }
-    };
-    recog.onresult = ev => {
-      if (locked) return;
-      // scan every alternative across results for a parse that matches the answer
-      let display = '';
-      for (let i = ev.resultIndex; i < ev.results.length; i++) {
-        const res = ev.results[i];
-        for (let j = 0; j < res.length; j++) {
-          const transcript = res[j].transcript;
-          if (!display) display = transcript.trim();
-          const n = parseSpokenNumber(transcript);
-          if (n === answer) {            // first confident correct match -> advance
-            heardEl.textContent = transcript.trim();
-            submitVoice(n);
-            return;
-          }
+    session = new SpeechRec();
+  } catch (err) { return; }
+  recog = session;
+  session.lang = 'en-US';
+  session.interimResults = true;     // fast partial guesses
+  session.maxAlternatives = 5;       // scan alternates for a match
+  session.continuous = false;        // single-shot; we loop manually
+
+  session.onstart = () => {
+    if (recog === session) setMicState('listening');
+  };
+
+  session.onresult = ev => {
+    if (locked) return;
+    let display = '';
+    for (let i = ev.resultIndex; i < ev.results.length; i++) {
+      const res = ev.results[i];
+      for (let j = 0; j < res.length; j++) {
+        const transcript = res[j].transcript;
+        if (!display) display = transcript.trim();
+        const n = parseSpokenNumber(transcript);
+        if (n === answer) {            // first confident correct match -> advance
+          heardEl.textContent = transcript.trim();
+          submitVoice(n);
+          return;
         }
       }
-      if (display) heardEl.textContent = display;
-      // if a final result parsed to a wrong number, count it as a wrong answer
-      const last = ev.results[ev.results.length - 1];
-      if (last && last.isFinal) {
-        const n = parseSpokenNumber(last[0].transcript);
-        if (n !== null && n !== answer) submitVoice(n);
-      }
-    };
-    recog.start();
+    }
+    if (display) heardEl.textContent = display;
+    // a clearly-final wrong number counts as a wrong answer
+    const last = ev.results[ev.results.length - 1];
+    if (last && last.isFinal) {
+      const n = parseSpokenNumber(last[0].transcript);
+      if (n !== null && n !== answer) { submitVoice(n); return; }
+    }
+  };
+
+  session.onerror = ev => {
+    if (recog !== session) return;
+    if (ev.error === 'not-allowed' || ev.error === 'service-not-allowed') {
+      listenWindowOpen = false;
+      setMicState('blocked');
+      heardEl.textContent = 'Allow mic access';
+    }
+    // 'no-speech' / 'aborted' / 'network' fall through to onend, which re-arms
+  };
+
+  session.onend = () => {
+    if (recog !== session) return;   // a newer session has taken over
+    recog = null;
+    if (!listenWindowOpen || locked) return;
+    // Android ended the single-shot session; re-arm after a tiny gap.
+    setMicState('rearming');
+    rearmTimer = setTimeout(() => {
+      rearmTimer = null;
+      armRecognition();
+    }, 180);
+  };
+
+  try {
+    session.start();
   } catch (err) {
-    // some browsers throw if start() called too quickly; ignore
+    // start() can throw if called too soon after a previous stop; retry shortly
+    recog = null;
+    setMicState('rearming');
+    rearmTimer = setTimeout(() => { rearmTimer = null; armRecognition(); }, 220);
   }
 }
 
 function stopListening() {
+  listenWindowOpen = false;
+  if (rearmTimer) { clearTimeout(rearmTimer); rearmTimer = null; }
   if (recog) {
-    try { recog.onresult = null; recog.onend = null; recog.stop(); } catch (e) {}
+    const s = recog;
     recog = null;
+    try { s.onresult = null; s.onend = null; s.onerror = null; s.onstart = null; s.abort(); } catch (e) {}
   }
-  recogActive = false;
-  micEl.classList.remove('listening');
+  setMicState('idle');
 }
 
 function submitVoice(n) {
